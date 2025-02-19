@@ -102,7 +102,6 @@ class GRUWrapper(BaseEstimator, RegressorMixin):
             y_pred = self.model(X_tensor).cpu().numpy()
             # นำผลลัพธ์กลับสู่สเกลของ y ดั้งเดิม
             y_pred = self.scaler_y.inverse_transform(y_pred)
-            print(y_pred)
         return y_pred.flatten()
 
 
