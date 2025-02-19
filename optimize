@@ -1,0 +1,319 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.model_selection import RandomizedSearchCV, train_test_split
+from sklearn.preprocessing import MinMaxScaler, RobustScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from torch.utils.data import DataLoader, TensorDataset
+import time
+
+# Record start time of the entire program
+start_time = time.time()
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Load the data
+df = pd.read_excel('project_data_003.xlsx')
+
+# Define input and target variables
+X = df[['month', 'building', 'Area', 'Eusers', 'Eusers-1', 'Eusers-2', 'Eusers-3', 'Eusers-4', 'Eusers-5',
+        'Eusers-6', 'Eusers-7', 'Eusers-8', 'Eusers-9', 'Eusers-10', 'Eusers-11', 'exam', 'exam-1',
+        'exam-2', 'exam-3', 'exam-4', 'exam-5', 'exam-6', 'exam-7', 'exam-8', 'exam-9', 'exam-10',
+        'exam-11', 'semester', 'semester-1', 'semester-2', 'semester-3', 'semester-4', 'semester-5',
+        'semester-6', 'semester-7', 'semester-8', 'semester-9', 'semester-10', 'semester-11', 'Holiday', 'Holiday-1',
+        'Holiday-2', 'Holiday-3', 'Holiday-4', 'Holiday-5', 'Holiday-6', 'Holiday-7', 'Holiday-8', 'Holiday-9',
+        'Holiday-10',
+        'Holiday-11', 'Unit', 'Unit-1', 'Unit-2', 'Unit-3', 'Unit-4', 'Unit-5', 'Unit-6', 'Unit-7', 'Unit-8', 'Unit-9',
+        'Unit-10', 'Unit-11']].values
+
+target_columns = ['Unit+1', 'Unit+2', 'Unit+3', 'Unit+4', 'Unit+5', 'Unit+6', 'Unit+7', 'Unit+8', 'Unit+9', 'Unit+10',
+                  'Unit+11', 'Unit+12']
+
+
+class GRUModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
+        super(GRUModel, self).__init__()
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.batch_norm = nn.BatchNorm1d(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
+        self.fc2 = nn.Linear(hidden_size // 2, output_size)
+        self.activation = nn.LeakyReLU()
+
+    def forward(self, x):
+        _, hn = self.gru(x)
+        out = hn[-1]
+        out = self.batch_norm(out)
+        out = self.activation(out)
+        out = self.dropout(out)
+        out = self.fc1(out)
+        out = self.activation(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        return out
+
+
+# Early stopping implementation
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0.001, verbose=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
+
+    def __call__(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    print('Early stopping triggered')
+        return self.early_stop
+
+
+class GRUWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, hidden_size=128, num_layers=2, learning_rate=0.001, dropout=0.2, num_epochs=150, batch_size=64):
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.learning_rate = learning_rate
+        self.dropout = dropout
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.model = None
+        self.scaler_y = RobustScaler()
+        self.best_model_state = None
+
+    def _validate(self, X_val, y_val):
+        """Compute validation loss"""
+        self.model.eval()
+        with torch.no_grad():
+            X_tensor = torch.FloatTensor(X_val).unsqueeze(1).to(device)
+            y_tensor = torch.FloatTensor(y_val).unsqueeze(1).to(device)
+            outputs = self.model(X_tensor)
+            criterion = nn.SmoothL1Loss()
+            val_loss = criterion(outputs, y_tensor).item()
+        return val_loss
+
+    def fit(self, X, y):
+        # Scale y values
+        y_scaled = self.scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+
+        # Create validation set
+        X_train, X_val, y_train_scaled, y_val_scaled = train_test_split(X, y_scaled, test_size=0.15, random_state=42)
+
+        # Convert data to PyTorch tensors
+        X_tensor = torch.FloatTensor(X_train).unsqueeze(1).to(device)
+        y_tensor = torch.FloatTensor(y_train_scaled).unsqueeze(1).to(device)
+
+        # Create DataLoader with pin_memory for faster data transfer to GPU
+        dataset = TensorDataset(X_tensor, y_tensor)
+        train_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True,
+                                  pin_memory=True if torch.cuda.is_available() else False)
+
+        # Initialize model with improvements
+        self.model = GRUModel(
+            input_size=X.shape[1],
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            output_size=1,
+            dropout=self.dropout
+        ).to(device)
+
+        # Use AdamW optimizer with weight decay for better regularization
+        optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+
+        # Use a combination of L1 and L2 loss for better stability
+        criterion = lambda pred, target: (
+                0.7 * nn.SmoothL1Loss()(pred, target) +
+                0.3 * nn.MSELoss()(pred, target)
+        )
+
+        # Learning rate scheduler with warm-up
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.learning_rate,
+            epochs=self.num_epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,  # Warm-up for 30% of training
+            div_factor=25,
+            final_div_factor=1000
+        )
+
+        # Initialize early stopping with reduced patience
+        early_stopping = EarlyStopping(patience=7, min_delta=0.0005, verbose=False)
+        best_val_loss = float('inf')
+
+        # Training loop with improvements
+        self.model.train()
+        for epoch in range(self.num_epochs):
+            epoch_loss = 0
+            for X_batch, y_batch in train_loader:
+                optimizer.zero_grad()
+                outputs = self.model(X_batch)
+                loss = criterion(outputs, y_batch)
+                loss.backward()
+
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+
+                optimizer.step()
+                scheduler.step()
+                epoch_loss += loss.item()
+
+            # Validation
+            val_loss = self._validate(X_val, y_val_scaled)
+
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self.best_model_state = self.model.state_dict().copy()
+
+            # Early stopping check
+            if early_stopping(val_loss):
+                break
+
+        # Load best model
+        if self.best_model_state is not None:
+            self.model.load_state_dict(self.best_model_state)
+
+        return self
+
+    def predict(self, X):
+        self.model.eval()
+        predictions = []
+
+        # Create batches for prediction
+        X_tensor = torch.FloatTensor(X).unsqueeze(1).to(device)
+        dataset = TensorDataset(X_tensor)
+        loader = DataLoader(dataset, batch_size=256, shuffle=False,
+                            pin_memory=True if torch.cuda.is_available() else False)
+
+        with torch.no_grad():
+            for batch in loader:
+                batch_X = batch[0]
+                outputs = self.model(batch_X).cpu().numpy()
+                predictions.append(outputs)
+
+        y_pred = np.vstack(predictions)
+        return self.scaler_y.inverse_transform(y_pred).flatten()
+
+
+# Define parameter grid for RandomizedSearchCV
+param_grid = {
+    'hidden_size': [128, 256],
+    'num_layers': [2, 3, 4],
+    'learning_rate': [0.001, 0.0005, 0.0001],
+    'dropout': [0.2, 0.3, 0.4],
+    'batch_size': [64, 128, 256]
+}
+
+# Store all results
+all_results = []
+
+# For each target column
+for target in target_columns:
+    target_start_time = time.time()
+
+    print(f"\nProcessing target: {target}")
+    print('----------------------------------------------------------------------------')
+
+    # Define target variable for current iteration
+    y = df[target].values
+
+    # Handle anomalies
+    if np.any(np.isnan(y)) or np.any(np.isinf(y)):
+        y = np.nan_to_num(y, nan=0, posinf=1e6, neginf=-1e6)
+
+    # Scale input features
+    scaler_X = MinMaxScaler()
+    X_scaled = scaler_X.fit_transform(X)
+
+    # Split data into training and test sets
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.3, random_state=28)
+
+    # Check for imbalanced data and print data distribution
+    print(f"Data distribution - y_train range: {y_train.min():.2f} to {y_train.max():.2f}, mean: {y_train.mean():.2f}")
+    print(f"Data distribution - y_test range: {y_test.min():.2f} to {y_test.max():.2f}, mean: {y_test.mean():.2f}")
+
+    # Use RandomizedSearchCV
+    random_search = RandomizedSearchCV(
+        GRUWrapper(num_epochs=50),
+        param_distributions=param_grid,
+        n_iter=10,
+        cv=5,
+        scoring='r2',
+        verbose=1,
+        n_jobs=-1,
+        random_state=42
+    )
+
+    # Fit the model
+    print("Starting RandomizedSearchCV...")
+    random_search.fit(X_train, y_train)
+    print("RandomizedSearchCV completed")
+
+    # Get best model and make predictions
+    best_model = random_search.best_estimator_
+    y_train_pred = best_model.predict(X_train)
+    y_test_pred = best_model.predict(X_test)
+
+    # Calculate metrics
+    rmse_train = np.sqrt(mean_squared_error(y_train, y_train_pred))
+    r2_train = r2_score(y_train, y_train_pred)
+    rmse_test = np.sqrt(mean_squared_error(y_test, y_test_pred))
+    r2_test = r2_score(y_test, y_test_pred)
+
+
+    # Calculate MAPE
+    def safe_mape(y_true, y_pred, epsilon=1e-8):
+        mask = np.abs(y_true) > epsilon
+        return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100 if np.any(mask) else np.nan
+
+
+    mape_train = safe_mape(y_train, y_train_pred)
+    mape_test = safe_mape(y_test, y_test_pred)
+
+    target_end_time = time.time()
+
+    # Store results
+    results = {
+        'Target': target,
+        'RMSE (Train)': rmse_train,
+        'R^2 (Train)': r2_train,
+        'MAPE (Train, %)': mape_train,
+        'RMSE (Test)': rmse_test,
+        'R^2 (Test)': r2_test,
+        'MAPE (Test, %)': mape_test,
+        'Best Hyperparameters': random_search.best_params_,
+        'Best R2 Score': random_search.best_score_,
+        'Runtime (seconds)': target_end_time - target_start_time
+    }
+
+    all_results.append(results)
+
+    print(f"Best parameters: {random_search.best_params_}")
+    print(f"Best R2 Score: {random_search.best_score_:.4f}")
+    print(f"Test RMSE: {rmse_test:.4f}")
+    print(f"Test R2: {r2_test:.4f}")
+    print(f"Runtime: {target_end_time - target_start_time:.2f} seconds")
+
+# Save results to CSV
+results_df = pd.DataFrame(all_results)
+results_df.to_csv('gru_results_optimized.csv', index=False)
+
+# Record end time and print total runtime
+end_time = time.time()
+print(f"\nTotal Runtime: {end_time - start_time:.2f} seconds")
+print(f"Average runtime per target: {(end_time - start_time) / len(target_columns):.2f} seconds")
